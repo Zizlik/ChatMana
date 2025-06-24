@@ -1,0 +1,223 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: chat_management_db
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-chat_management}
+      POSTGRES_USER: ${POSTGRES_USER:-chat_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CHANGE_THIS_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/migrations:/docker-entrypoint-initdb.d
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    networks:
+      - chat_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-chat_user} -d ${POSTGRES_DB:-chat_management}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: chat_management_redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-CHANGE_THIS_REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    networks:
+      - chat_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-CHANGE_THIS_REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: chat_management_backend
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: ${PORT:-3001}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chat_user}:${POSTGRES_PASSWORD:-CHANGE_THIS_PASSWORD}@postgres:5432/${POSTGRES_DB:-chat_management}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-CHANGE_THIS_REDIS_PASSWORD}@redis:6379
+    ports:
+      - "${PORT:-3001}:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - chat_network
+    restart: unless-stopped
+    volumes:
+      - backend_logs:/app/logs
+      - backend_uploads:/app/uploads
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  # Frontend Application
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: chat_management_frontend
+    env_file:
+      - .env
+    environment:
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:3001}
+      VITE_WS_URL: ${VITE_WS_URL:-ws://localhost:3001}
+    ports:
+      - "3000:8080"
+    networks:
+      - chat_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+    profiles:
+      - frontend
+
+  # Production Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: chat_management_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - frontend_dist:/usr/share/nginx/html:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    networks:
+      - chat_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+    profiles:
+      - production
+
+  # Database Migration Runner
+  migrator:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: chat_management_migrator
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chat_user}:${POSTGRES_PASSWORD:-CHANGE_THIS_PASSWORD}@postgres:5432/${POSTGRES_DB:-chat_management}
+    command: ["npm", "run", "migrate:up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - chat_network
+    profiles:
+      - migration
+
+  # Database Seeder
+  seeder:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: chat_management_seeder
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-chat_user}:${POSTGRES_PASSWORD:-CHANGE_THIS_PASSWORD}@postgres:5432/${POSTGRES_DB:-chat_management}
+    command: ["npm", "run", "seed"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - chat_network
+    profiles:
+      - seed
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  backend_logs:
+    driver: local
+  backend_uploads:
+    driver: local
+  frontend_dist:
+    driver: local
+
+networks:
+  chat_network:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1
+    driver_opts:
+      com.docker.network.bridge.name: chat_bridge
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+      com.docker.network.driver.mtu: 1500
